@@ -40,6 +40,10 @@ void myformat(int size) {
   // fatents + data blocks = (size - 101)
   // # of fatents = (data blocks / 128)
   
+  // Block 0: VCB
+  // Blocks 1-100 = dirents
+  // Blocks 101-rest = fat blocks + data blocks
+  
   
   // Since fatents are 4 bytes, we can fit 128 of them in one block
   // BLOCKSIZE is defined in disk.c (which we are not to modify)

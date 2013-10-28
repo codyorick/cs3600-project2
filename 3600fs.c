@@ -38,9 +38,12 @@
 #include "3600fs.h"
 #include "disk.h"
 
-// VCB and dirents stored when we are mounted
+// VCB, dirents and fatents stored when we are mounted
 vcb myvcb;
 dirent mydirents[100];
+// fat entries will vary in number
+fatent *myfatents;
+
 
 // Finds the block number of the desired dirent of the file name, or -1 if not found
 static int find_file(const char *path) {
@@ -75,12 +78,23 @@ static void* vfs_mount(struct fuse_conn_info *conn) {
   memset(temp, 0, BLOCKSIZE);
   dread(0, temp); // load the vcb (at block 0) into temp
   memcpy(&myvcb, temp, sizeof(vcb)); // copy it to global variable
-  
+  if(myvcb.magic != MAGICNUMBER) {
+    fprintf(stderr, "incorrect disk\n");
+    exit(1);
+  }
   // load all dirents into global dirent array
   for(int i = 1; i < 101; i++) {
     memset(temp, 0, BLOCKSIZE);
     dread(i, temp);
     memcpy(&mydirents[i-1], temp, sizeof(dirent));
+  }
+  
+  // load all fatent blocks
+  myfatents = malloc(myvcb.fat_length * BLOCKSIZE);
+  for(int i = 0; i < myvcb.fat_length; i++) {
+    memset(temp, 0, BLOCKSIZE);
+    dread(myvcb.fat_start + i, temp);
+    memcpy(myfatents + 128*i, temp, BLOCKSIZE); // since each fatent is 4 bytes, load 128 per block
   }
 
   return NULL;
@@ -237,7 +251,22 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     return -1;
     
   // otherwise, create the dirent
+  // find space in fatents/data blocks
+  int fatnum = -1;
+  for(int i = 0; i < (myvcb.fat_length * 128); i++) {
+    if(myfatents[i].used == 0) {
+      myfatents[i].used = 1;
+      myfatents[i].eof = 1;
+      fatnum = i;
+      break;
+    }
+  }
+  // if fatnum is still -1, there's no more room
+  if(fatnum == -1)
+    return -1;
+  
   mydirents[empty].valid = 1;
+  mydirents[empty].first_block = fatnum;
   mydirents[empty].user = geteuid();
   mydirents[empty].group = getegid();
   mydirents[empty].mode = mode;
@@ -264,8 +293,16 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
 static int vfs_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-
-    return 0;
+  // make sure the file exists/find dirent block
+  int block = find_file(path);
+  if(block == -1)
+    return -1;
+  
+  // read "size" bytes from file "path", starting at "offset", into "buf"
+  // first block, buf, size, offset, dirent size
+  
+  
+  return 0;
 }
 
 /*
@@ -282,9 +319,44 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t offset,
 static int vfs_write(const char *path, const char *buf, size_t size,
                      off_t offset, struct fuse_file_info *fi)
 {
-
   /* 3600: NOTE THAT IF THE OFFSET+SIZE GOES OFF THE END OF THE FILE, YOU
            MAY HAVE TO EXTEND THE FILE (ALLOCATE MORE BLOCKS TO IT). */
+  
+  // make sure the file exists
+  int block = find_file(path);
+  if(block == -1)
+    return -1;
+    
+  // write "size" bytes from "buf" into "path" starting at "offset"
+  int startblock = mydirents[block].first_block;
+  int filesize = mydirents[block].size;
+  // if "size" is less than blocksize, we only have to use one block
+  if(size <= BLOCKSIZE) {
+    char temp[BLOCKSIZE];
+    memset(temp, 0, BLOCKSIZE);
+    memcpy(temp + offset, buf, size);
+    dwrite(myvcb.db_start + startblock, temp);
+  } else {
+    // we need to use multiple blocks
+    // the first block was allocated when the file was created
+    // find how many new blocks we need
+    int newblocks = ((size - BLOCKSIZE) + (BLOCKSIZE-1)) / BLOCKSIZE; // this will round it up
+    // find that many empty fatents, add the indexes to an array
+    int fatnums[newblocks];
+    int added = 0;
+    for(int i = 0; (i < (myvcb.fat_length * 128)) && (added < newblocks); i++) {
+      if(myfatents[i].used == 0) {
+        myfatents[i].used = 1;
+        fatnums[added] = i;
+        added++;
+      }
+    }
+    // if we've added less than the number required, we are out of room
+    if(added < newblocks)
+      return -1;
+    
+  }
+  
 
   return 0;
 }
