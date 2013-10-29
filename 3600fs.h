@@ -47,11 +47,10 @@ typedef struct dirent_s {
   uid_t user;                         // 4
   gid_t group;                        // 4
   mode_t mode;                        // 4
-  struct timespec access_time;  // 8
-  struct timespec modify_time;  // 8
-  struct timespec create_time;  // 8
-  // has to be at least 27; we're at 48; 512 - 48 = 464
-  char name[464];                     // 464
+  struct timespec access_time;
+  struct timespec modify_time;
+  struct timespec create_time;
+  char name[440];                     
 } dirent;                             // 512 bytes
 
 // FAT Entry struct

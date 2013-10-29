@@ -55,6 +55,19 @@ static int find_file(const char *path) {
   return -1;
 }
 
+// Finds a free fat entry, or -1 if not found
+static int find_fatent() {
+  for(int i = 0; i < myvcb.fat_length * 128; i++) {
+    if(myfatents[i].used == 0) {
+      myfatents[i].used = 1;
+      myfatents[i].eof = 1;
+      return i;
+    }
+  }
+  // if we get here, there are no more fatents
+  return -1;
+}
+
 /*
  * Initialize filesystem. Read in file system metadata and initialize
  * memory structures. If there are inconsistencies, now would also be
@@ -116,6 +129,14 @@ static void vfs_unmount (void *private_data) {
     memset(temp, 0, BLOCKSIZE);
     memcpy(temp, &mydirents[i], sizeof(dirent));
     dwrite(i+1, temp);
+  }
+  
+  // write fatents back
+  for(int i = 0; i < myvcb.fat_length; i++) {
+    char temp[BLOCKSIZE];
+    memset(temp, 0, BLOCKSIZE);
+    memcpy(temp, myfatents + 128*i, BLOCKSIZE);
+    dwrite(myvcb.fat_start + i, temp);
   }
 
   // Do not touch or move this code; unconnects the disk
@@ -251,22 +272,7 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     return -1;
     
   // otherwise, create the dirent
-  // find space in fatents/data blocks
-  int fatnum = -1;
-  for(int i = 0; i < (myvcb.fat_length * 128); i++) {
-    if(myfatents[i].used == 0) {
-      myfatents[i].used = 1;
-      myfatents[i].eof = 1;
-      fatnum = i;
-      break;
-    }
-  }
-  // if fatnum is still -1, there's no more room
-  if(fatnum == -1)
-    return -1;
-  
   mydirents[empty].valid = 1;
-  mydirents[empty].first_block = fatnum;
   mydirents[empty].user = geteuid();
   mydirents[empty].group = getegid();
   mydirents[empty].mode = mode;
@@ -299,10 +305,20 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t offset,
     return -1;
   
   // read "size" bytes from file "path", starting at "offset", into "buf"
-  // first block, buf, size, offset, dirent size
+  int bytes = 0;
+  if(size + offset > mydirents[block].size) {
+    bytes = mydirents[block].size - offset;
+  }
   
+  // just read one block
+  if(offset % BLOCKSIZE + bytes <= BLOCKSIZE) {
+    char temp[BLOCKSIZE];
+    memset(temp, 0, BLOCKSIZE);
+    dread(myvcb.db_start + mydirents[block].first_block, temp);
+    memcpy(buf, temp + offset % BLOCKSIZE, bytes);
+  }
   
-  return 0;
+  return bytes;
 }
 
 /*
@@ -321,41 +337,56 @@ static int vfs_write(const char *path, const char *buf, size_t size,
 {
   /* 3600: NOTE THAT IF THE OFFSET+SIZE GOES OFF THE END OF THE FILE, YOU
            MAY HAVE TO EXTEND THE FILE (ALLOCATE MORE BLOCKS TO IT). */
-  
   // make sure the file exists
   int block = find_file(path);
   if(block == -1)
     return -1;
     
   // write "size" bytes from "buf" into "path" starting at "offset"
-  int startblock = mydirents[block].first_block;
+  // if "size" is 0 for whatever reason, do nothing
+  if(size == 0)
+    return 0;
+    
+  // write small files
   int filesize = mydirents[block].size;
-  // if "size" is less than blocksize, we only have to use one block
-  if(size <= BLOCKSIZE) {
+  if(filesize == 0 && size <= BLOCKSIZE) {
     char temp[BLOCKSIZE];
     memset(temp, 0, BLOCKSIZE);
     memcpy(temp + offset, buf, size);
-    dwrite(myvcb.db_start + startblock, temp);
-  } else {
-    // we need to use multiple blocks
-    // the first block was allocated when the file was created
-    // find how many new blocks we need
-    int newblocks = ((size - BLOCKSIZE) + (BLOCKSIZE-1)) / BLOCKSIZE; // this will round it up
-    // find that many empty fatents, add the indexes to an array
-    int fatnums[newblocks];
-    int added = 0;
-    for(int i = 0; (i < (myvcb.fat_length * 128)) && (added < newblocks); i++) {
-      if(myfatents[i].used == 0) {
-        myfatents[i].used = 1;
-        fatnums[added] = i;
-        added++;
-      }
-    }
-    // if we've added less than the number required, we are out of room
-    if(added < newblocks)
+    int startblock = find_fatent();
+    if(startblock == -1)
       return -1;
-    
+    mydirents[block].first_block = startblock;
+    mydirents[block].size = size + offset;
+    dwrite(myvcb.db_start + startblock, temp);
+    return size + offset; 
   }
+  
+  /*
+  // how to do this: get the current size of the file, find how many blocks it
+  // uses, find how many more blocks we will need to allocate based on the 
+  // offset and the size, then allocate the blocks/fatents. then, actually 
+  // write the data?
+  int currblocks = (filesize + (BLOCKSIZE-1)) / BLOCKSIZE;
+  // the new size of the file
+  int newsize;
+  if((offset + size) > filesize) {
+    newsize = offset + size;
+  } else {
+    // we just overwrite existing data
+    newsize = filesize;
+  }
+  int newblocks = (newsize + (BLOCKSIZE-1)) / BLOCKSIZE;
+  int numnew = newblocks - currblocks; // number of new blocks we need
+  // find the blocks we're using currently
+  int fatnums[currblocks];
+  if(currblocks > 0) {
+    int startblock = mydirents[block].first_block;
+    for(int i = 0; i < currblocks; i++) {
+      
+    }
+  }
+  */
   
 
   return 0;
@@ -373,13 +404,14 @@ static int vfs_delete(const char *path)
     
     // find the file, mark the dirent as free
   for(int i = 0; i < 100; i++) {
-    if(strcmp(mydirents[i].name, path) == 0 && mydirents[i].valid == 1) {
+    if(strcmp(mydirents[i].name, path) == 0 && mydirents[i].valid) {
       mydirents[i].valid = 0;
       mydirents[i].name[0] = '\0';
+      int j = mydirents[i].first_block;
+      myfatents[j].used = 0;
       return 0;
     }
   }
-
   // if we get here, the file wasn't found
   return -1;
 }
@@ -417,8 +449,11 @@ static int vfs_rename(const char *from, const char *to)
  */
 static int vfs_chmod(const char *file, mode_t mode)
 {
-
-    return 0;
+  int block = find_file(file);
+  if(block == -1)
+    return -1;
+  mydirents[block].mode = (mode & 0x0000ffff);
+  return 0;
 }
 
 /*
@@ -428,8 +463,12 @@ static int vfs_chmod(const char *file, mode_t mode)
  */
 static int vfs_chown(const char *file, uid_t uid, gid_t gid)
 {
-
-    return 0;
+  int block = find_file(file);
+  if(block == -1)
+    return -1;
+  mydirents[block].user = uid;
+  mydirents[block].group = gid;
+  return 0;
 }
 
 /*
@@ -438,8 +477,12 @@ static int vfs_chown(const char *file, uid_t uid, gid_t gid)
  */
 static int vfs_utimens(const char *file, const struct timespec ts[2])
 {
-
-    return 0;
+  int block = find_file(file);
+  if(block == -1)
+    return -1;
+  mydirents[block].access_time = ts[0];
+  mydirents[block].modify_time = ts[1];
+  return 0;
 }
 
 /*
